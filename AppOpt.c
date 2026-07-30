@@ -935,7 +935,7 @@ static void proc_collect(const AppConfig* cfg, ProcCache* cache, size_t* count) 
     closedir(proc_dir);
 }
 
-static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_counter) {
+static void update_cache(ProcCache* cache, const AppConfig* cfg, bool* force_affinity) {
     bool need_reload = false;
     struct sysinfo info;
     if (sysinfo(&info) != 0) {
@@ -945,7 +945,7 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
         if (current_proc_count > cache->last_proc_count + 11) {
             need_reload = true;
         } else if (current_proc_count > cache->last_proc_count) {
-            *affinity_counter = 0;
+            *force_affinity = true;
         }
         cache->last_proc_count = current_proc_count;
     }
@@ -980,7 +980,7 @@ static void update_cache(ProcCache* cache, const AppConfig* cfg, int* affinity_c
         }
         
         cache->num_procs = new_count;
-        *affinity_counter = 0;
+        *force_affinity = true;
         if (cache->scan_all_proc) cache->scan_all_proc = false;
     }
 }
@@ -1158,6 +1158,8 @@ static int parse_freq_list(const char* str, int* out, int max_out) {
 typedef struct {
     /* [app] */
     int  sleep_interval;
+    int  freq_interval;        /* 无内核模块时频率写入间隔(秒) */
+    int  freq_interval_kmod;   /* 有内核模块时频率写入间隔(秒) */
 
     /* [power] */
     bool power_save_enabled;
@@ -1180,6 +1182,8 @@ typedef struct {
 static TuberConfig tuber_defaults(void) {
     TuberConfig c = {0};
     c.sleep_interval      = 2;
+    c.freq_interval       = 4;
+    c.freq_interval_kmod  = 30;
     c.power_save_enabled  = false;
     c.temp_limit_mc       = 0;
     c.on_poll_ms          = -1;   /* -1 = 不写内核模块 */
@@ -1250,6 +1254,8 @@ static bool load_tuber_config(const char* path, TuberConfig* cfg) {
 
         if (strcmp(section, "app") == 0) {
             count += parse_int_val(t, "sleep_interval", &cfg->sleep_interval);
+            count += parse_int_val(t, "freq_interval", &cfg->freq_interval);
+            count += parse_int_val(t, "freq_interval_kmod", &cfg->freq_interval_kmod);
         } else if (strcmp(section, "power") == 0) {
             count += parse_bool_val(t, "enabled", &cfg->power_save_enabled);
             count += parse_int_val(t, "temp_limit_mc", &cfg->temp_limit_mc);
@@ -1421,7 +1427,7 @@ int main(int argc, char **argv) {
 
     ProcCache cache = {0};
     cache.scan_all_proc = true;
-    int affinity_counter = 0;
+    bool affinity_force = false;
     printf("启动AppOpt服务 v%s\n", VERSION);
     /* 启动时写入内核 poll_ms */
     kmod_write_poll_ms(topo.poll_ms);
@@ -1431,10 +1437,8 @@ int main(int argc, char **argv) {
         printf("检测到 abk_soc_opt 内核模块，频率限制由内核强制执行\n");
 
     bool prev_display_off = false;
-    time_t display_off_at = 0;
+    time_t display_off_at = 0, last_affinity = 0, last_thermal = 0, last_freq = 0;
 
-    int thermal_counter = 0;
-    int freq_counter = 0;
     bool thermal_active = false;
     int active_freq = 0;
 
@@ -1452,12 +1456,12 @@ int main(int argc, char **argv) {
             else if (!display_off)
                 display_off_at = 0;
 
-            bool effective_off = display_off &&
+            bool eff_off = display_off &&
                 (display_off_at > 0) &&
                 (now - display_off_at >= (time_t)tcfg.off_delay_sec);
 
-            if (effective_off != prev_display_off) {
-                if (effective_off && cfg->topo.use_display_off_freqs) {
+            if (eff_off != prev_display_off) {
+                if (eff_off && cfg->topo.use_display_off_freqs) {
                     apply_cluster_freqs(cfg->topo.display_off_freqs, &cfg->topo);
                     kmod_write_freqs(cfg->topo.display_off_freqs,
                                      cfg->topo.num_clusters, &cfg->topo);
@@ -1477,21 +1481,23 @@ int main(int argc, char **argv) {
                            cfg->topo.poll_ms, sleep_interval);
                 }
             }
-            prev_display_off = effective_off;
+            prev_display_off = eff_off;
 
-            update_cache(&cache, cfg, &affinity_counter);
-            affinity_counter--;
-            if (affinity_counter < 1) {
+            update_cache(&cache, cfg, &affinity_force);
+
+            /* ── 亲和性写入: 每N秒或强制 ── */
+            int aff_int = eff_off ? 10 : 5;
+            if (affinity_force || now - last_affinity >= aff_int) {
                 apply_affinity(&cache, &cfg->topo);
                 if (cfg->topo.power_save_mode)
                     apply_power_save(&cache, &cfg->topo);
-                affinity_counter = 5;
+                last_affinity = now;
+                affinity_force = false;
             }
 
-            thermal_counter--;
-            if (thermal_counter < 1) {
-                thermal_counter = 10;
-                if (cfg->topo.power_save_mode && cfg->topo.temp_limit_mc > 0) {
+            /* ── 温控检测: 每 10 秒 ── */
+            if (cfg->topo.power_save_mode && cfg->topo.temp_limit_mc > 0 &&
+                now - last_thermal >= 10) {
                     int cur_temp = read_thermal_max();
                     bool was_active = thermal_active;
                     thermal_active = (cur_temp > cfg->topo.temp_limit_mc);
@@ -1524,25 +1530,25 @@ int main(int argc, char **argv) {
                             }
                         }
                     }
-                }
+                last_thermal = now;
             }
 
-            freq_counter--;
-            if (freq_counter < 1) {
-                freq_counter = 2;   // ~4s一次，对抗系统perfd重置
-                if (!thermal_active) {
-                    if (cfg->topo.use_cluster_freqs) {
-                        apply_cluster_freqs(cfg->topo.cluster_freqs, &cfg->topo);
-                        kmod_write_freqs(cfg->topo.cluster_freqs,
-                                           cfg->topo.num_clusters, &cfg->topo);
-                    } else {
-                        int target = cfg->topo.max_freq_limit;
-                        if (target > 0 && target != active_freq) {
-                            apply_freq_limit(target, &cfg->topo);
-                            active_freq = target;
-                        }
+            /* ── 频率写入: 有kmod间隔长, 无kmod间隔短, 息屏加倍 ── */
+            int freq_int = kmod_available() ? tcfg.freq_interval_kmod : tcfg.freq_interval;
+            if (eff_off) freq_int *= 2;
+            if (!thermal_active && now - last_freq >= freq_int) {
+                if (cfg->topo.use_cluster_freqs) {
+                    apply_cluster_freqs(cfg->topo.cluster_freqs, &cfg->topo);
+                    kmod_write_freqs(cfg->topo.cluster_freqs,
+                                     cfg->topo.num_clusters, &cfg->topo);
+                } else {
+                    int target = cfg->topo.max_freq_limit;
+                    if (target > 0 && target != active_freq) {
+                        apply_freq_limit(target, &cfg->topo);
+                        active_freq = target;
                     }
                 }
+                last_freq = now;
             }
 
             config_release(cfg);
