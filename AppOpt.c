@@ -1174,6 +1174,8 @@ typedef struct {
     int  off_poll_ms;
     int  off_sleep_interval;
     int  off_delay_sec;
+    int  off_freq_interval;       /* 息屏时无kmod频率写入间隔 */
+    int  off_freq_interval_kmod;  /* 息屏时有kmod频率写入间隔 */
 
     /* [thermal] */
     int  thermal_freqs[MAX_CLUSTERS];
@@ -1190,6 +1192,8 @@ static TuberConfig tuber_defaults(void) {
     c.off_poll_ms         = -1;
     c.off_sleep_interval  = 10;
     c.off_delay_sec       = 180;
+    c.off_freq_interval       = 8;
+    c.off_freq_interval_kmod  = 60;
     memset(c.on_freqs,    0, sizeof(c.on_freqs));
     memset(c.off_freqs,   0, sizeof(c.off_freqs));
     memset(c.thermal_freqs, 0, sizeof(c.thermal_freqs));
@@ -1267,6 +1271,8 @@ static bool load_tuber_config(const char* path, TuberConfig* cfg) {
             count += parse_int_val(t, "poll_ms", &cfg->off_poll_ms);
             count += parse_int_val(t, "sleep_interval", &cfg->off_sleep_interval);
             count += parse_int_val(t, "delay_sec", &cfg->off_delay_sec);
+            count += parse_int_val(t, "freq_interval", &cfg->off_freq_interval);
+            count += parse_int_val(t, "freq_interval_kmod", &cfg->off_freq_interval_kmod);
         } else if (strcmp(section, "thermal") == 0) {
             count += parse_freqs_val(t, "limits", cfg->thermal_freqs, MAX_CLUSTERS);
         }
@@ -1533,9 +1539,10 @@ int main(int argc, char **argv) {
                 last_thermal = now;
             }
 
-            /* ── 频率写入: 有kmod间隔长, 无kmod间隔短, 息屏加倍 ── */
-            int freq_int = kmod_available() ? tcfg.freq_interval_kmod : tcfg.freq_interval;
-            if (eff_off) freq_int *= 2;
+            /* ── 频率写入: 亮屏/息屏独立间隔 ── */
+            int freq_int = kmod_available()
+                ? (eff_off ? tcfg.off_freq_interval_kmod : tcfg.freq_interval_kmod)
+                : (eff_off ? tcfg.off_freq_interval      : tcfg.freq_interval);
             if (!thermal_active && now - last_freq >= freq_int) {
                 if (cfg->topo.use_cluster_freqs) {
                     apply_cluster_freqs(cfg->topo.cluster_freqs, &cfg->topo);
