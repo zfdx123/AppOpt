@@ -6,6 +6,7 @@
 #include <fnmatch.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -18,7 +19,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-#define VERSION            "1.7.0"
+#define VERSION            "1.8.0"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -92,6 +93,8 @@ typedef struct {
     char kmod_enabled[128];
     char kmod_freq_limits[128];
     char kmod_poll_ms[128];
+    char kmod_arm[128];        /* v2.5: 用户态持有接口，内核态生效的唯一前提 */
+    char kmod_active[128];     /* v2.5: 内核态是否真的在施加约束（只读） */
 } CpuTopology;
 
 typedef struct {
@@ -490,6 +493,8 @@ static void apply_cluster_freqs(const int freqs[MAX_CLUSTERS], const CpuTopology
  * 两种都要探测，否则换构建方式后会静默失效。 */
 #define KMOD_KO_ENABLED     "/sys/kernel/abk_soc_opt/enabled"
 #define KMOD_PARAM_ENABLED  "/sys/module/abk_soc_opt/parameters/enabled"
+#define KMOD_KO_ARM         "/sys/kernel/abk_soc_opt/arm"
+#define KMOD_KO_ACTIVE      "/sys/kernel/abk_soc_opt/active"
 
 /* 所有内核接口路径都在 init_cpu_topo() 之后、任何写入之前解析一次。
  * build_str() 不做追加，重复调用是幂等的。 */
@@ -499,15 +504,55 @@ static void kmod_lookup_kobj(CpuTopology* topo) {
     char*  pm = topo->kmod_poll_ms;
     size_t es = sizeof(topo->kmod_enabled);
 
+    /* arm/active 是 v2.5 新增的自定义 kobj 属性，不是模块参数。
+     * 必须显式确认节点存在，否则在旧版内核（v2.2/v2.4，无 arm 接口）上
+     * 会误判为"有 arm 接口但写入失败"，报出误导性的错误。 */
     if (access(KMOD_KO_ENABLED, W_OK) == 0) {
         build_str(e,  es, KMOD_KO_ENABLED, NULL);
         build_str(fl, es, KMOD_FREQ_LIMITS, NULL);
         build_str(pm, es, KMOD_POLL_MS, NULL);
+        if (access(KMOD_KO_ARM, W_OK) == 0)
+            build_str(topo->kmod_arm, sizeof(topo->kmod_arm), KMOD_KO_ARM, NULL);
+        if (access(KMOD_KO_ACTIVE, R_OK) == 0)
+            build_str(topo->kmod_active, sizeof(topo->kmod_active), KMOD_KO_ACTIVE, NULL);
     } else if (access(KMOD_PARAM_ENABLED, W_OK) == 0) {
         build_str(e,  es, KMOD_PARAM_ENABLED, NULL);
         build_str(fl, es, KMOD_PARAM_FREQ_LIMITS, NULL);
         build_str(pm, es, KMOD_PARAM_POLL_MS, NULL);
     }
+}
+
+/* ---------------------------------------------------------------------
+ * v2.5 用户态持有 (arming)
+ *
+ * 内核态默认完全不生效，必须由本进程写入自己的 pid 才开始工作。
+ * 内核侧看门狗会检查该 pid 是否存活、以及是否在超时内续期；
+ * 一旦本进程退出（含被 kill -9），内核会自动收起全部约束。
+ *
+ * 这从结构上排除了"内核态在跑但用户态没了"的半生效状态。
+ * ------------------------------------------------------------------- */
+
+/* 以本进程 pid 为持有者启用内核态。返回是否写入成功。 */
+static bool kmod_arm(const CpuTopology* topo) {
+    if (!topo->kmod_arm[0]) return false;
+
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", (int)getpid());
+    if (!write_file(AT_FDCWD, topo->kmod_arm, buf, O_WRONLY | O_TRUNC))
+        return false;
+
+    /* 回读 active 确认内核态真的开始施加约束了 */
+    char chk[16] = {0};
+    if (read_file(AT_FDCWD, topo->kmod_active, chk, sizeof(chk)))
+        return (chk[0] == '1');
+    return true;   /* 读不到 active 也不当作失败（旧内核没有这个属性） */
+}
+
+/* 主动收起。进程正常退出/收到信号时调用；即便没来得及调用，
+ * 内核看门狗也会在持有者消失后自动收起。 */
+static void kmod_disarm(const CpuTopology* topo) {
+    if (!topo->kmod_arm[0]) return;
+    write_file(AT_FDCWD, topo->kmod_arm, "0", O_WRONLY | O_TRUNC);
 }
 
 static bool kmod_available(void) {
@@ -541,6 +586,23 @@ static void kmod_write_poll_ms(const CpuTopology* topo, int ms) {
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", ms);
     write_file(AT_FDCWD, topo->kmod_poll_ms, buf, O_WRONLY | O_TRUNC);
+}
+
+/* --- 退出时 disarm ------------------------------------------------ */
+
+/* 信号处理器里要拿到 topo，所以需要一个全局指针。
+ * 只在 main 里赋值一次，之后只读，信号处理器可以安全访问。 */
+static const CpuTopology* g_topopt;
+
+static void on_exit_atexit(void) {
+    if (g_topopt) kmod_disarm(g_topopt);
+}
+
+static void on_exit_signal(int sig) {
+    if (g_topopt) kmod_disarm(g_topopt);
+    /* 恢复默认处理并重新抛出，让退出码保持"被信号终止"的语义 */
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 static bool is_display_off(void) {
@@ -1518,32 +1580,59 @@ int main(int argc, char **argv) {
         printf("息屏降频已启用 (%d clusters)\n", topo.num_clusters);
     if (kmod_available()) {
         printf("检测到 abk_soc_opt 内核模块: %s\n", topo.kmod_enabled);
-        /* 节点存在不等于模块在干活：内核态可能因为初始化时序问题没有扫到
-         * cluster（num_clusters==0）。那种情况下 freq_limits 的写入会被
-         * 静默接受但完全不生效（store 里 for(i<n && i<num_clusters) 直接空转），
-         * 读回也是空。所以"读失败"和"读成功但为空"都要告警，
-         * 否则用户会以为内核限频正在工作。 */
-        char info[256] = {0};
-        const char* info_path = strstr(topo.kmod_enabled, "/sys/module/")
-            ? "/sys/module/abk_soc_opt/parameters/cluster_info"
-            : "/sys/kernel/abk_soc_opt/cluster_info";
-        bool info_ok = read_file(AT_FDCWD, info_path, info, sizeof(info));
-        if (info_ok) strtrim(info);
 
-        if (!info_ok || info[0] == '\0') {
-            fprintf(stderr,
-                    "警告: abk_soc_opt 已加载，但 %s 读不到 cluster 信息。\n"
-                    "      说明内核态 num_clusters==0（初始化时序早于 cpufreq 驱动就绪），\n"
-                    "      内核限频不会生效，且无法通过重载模块恢复（builtin）。\n"
-                    "      当前仅靠用户态限频维持，效果会被 perfd/thermal 部分覆盖。\n",
-                    info_path);
+        if (topo.kmod_arm[0]) {
+            /* v2.5: 内核态默认不生效，由本进程 arm 之后才开始工作。
+             * 内核侧看门狗盯着本进程 pid，本进程一死就自动收起全部约束。 */
+            if (kmod_arm(&topo)) {
+                printf("已持有内核态 (arm pid=%d)，内核限频已生效\n", (int)getpid());
+            } else {
+                fprintf(stderr,
+                        "警告: arm 写入 %s 后内核态未生效 (active!=1)。\n"
+                        "      可能原因: cpufreq 驱动尚未就绪，内核会在重试成功后生效；\n"
+                        "      或 enabled=0。可稍后读 %s 确认。\n",
+                        topo.kmod_arm, topo.kmod_active);
+            }
+
+            char info[256] = {0};
+            if (read_file(AT_FDCWD, "/sys/kernel/abk_soc_opt/cluster_info",
+                          info, sizeof(info))) {
+                strtrim(info);
+                if (info[0])
+                    printf("内核模块 cluster 状态:\n%s\n", info);
+            }
         } else {
-            printf("内核模块 cluster 状态:\n%s\n", info);
+            /* 旧版内核模块（无 arm 接口）：退回原来的探测方式。
+             * 注意这种情况下内核态从一开始就在自行生效，没有用户态门控。 */
+            printf("内核模块无 arm 接口（旧版），内核态不受用户态门控\n");
+            char info[256] = {0};
+            const char* info_path = strstr(topo.kmod_enabled, "/sys/module/")
+                ? "/sys/module/abk_soc_opt/parameters/cluster_info"
+                : "/sys/kernel/abk_soc_opt/cluster_info";
+            bool info_ok = read_file(AT_FDCWD, info_path, info, sizeof(info));
+            if (info_ok) strtrim(info);
+
+            if (!info_ok || info[0] == '\0') {
+                fprintf(stderr,
+                        "警告: abk_soc_opt 已加载，但 %s 读不到 cluster 信息。\n"
+                        "      说明内核态 num_clusters==0，内核限频不会生效。\n"
+                        "      建议升级到 v2.5（支持用户态 arm 门控）。\n",
+                        info_path);
+            } else {
+                printf("内核模块 cluster 状态:\n%s\n", info);
+            }
         }
     } else {
         printf("未检测到 abk_soc_opt 内核模块，仅使用用户态限频\n");
     }
     fflush(stdout);
+
+    /* 注册退出处理：正常退出和被 TERM/INT 打到时都要 disarm。
+     * 即便来不及（比如 kill -9），内核看门狗也会在持有者消失后自动收起。 */
+    g_topopt = &topo;              /* 传给信号处理器，需要全局可见 */
+    signal(SIGTERM, on_exit_signal);
+    signal(SIGINT,  on_exit_signal);
+    atexit(on_exit_atexit);
 
     bool prev_display_off = false;
     time_t display_off_at = 0, last_affinity = 0, last_thermal = 0, last_freq = 0;
