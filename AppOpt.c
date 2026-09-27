@@ -18,7 +18,7 @@
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
-#define VERSION            "1.6.0"
+#define VERSION            "1.7.0"
 #define BASE_CPUSET        "/dev/cpuset/AppOpt"
 #define MAX_PKG_LEN        128
 #define MAX_THREAD_LEN     32
@@ -28,6 +28,10 @@
 #define KMOD_ENABLED      "/sys/kernel/abk_soc_opt/enabled"
 #define KMOD_FREQ_LIMITS  "/sys/kernel/abk_soc_opt/freq_limits"
 #define KMOD_POLL_MS      "/sys/kernel/abk_soc_opt/poll_ms"
+/* 同一模块若编成 LKM，参数会出现在 /sys/module 下而不是 /sys/kernel 下 */
+#define KMOD_PARAM_ENABLED     "/sys/module/abk_soc_opt/parameters/enabled"
+#define KMOD_PARAM_FREQ_LIMITS "/sys/module/abk_soc_opt/parameters/freq_limits"
+#define KMOD_PARAM_POLL_MS     "/sys/module/abk_soc_opt/parameters/poll_ms"
 
 typedef struct {
     char pkg[MAX_PKG_LEN];
@@ -84,6 +88,10 @@ typedef struct {
     int display_off_freqs[MAX_CLUSTERS];       // 息屏时 per-cluster 频率
     int display_off_poll_ms;                   // 息屏时 poll_ms, -1=不写入
     bool use_display_off_freqs;
+    /* abk_soc_opt 内核模块 sysfs 路径（builtin / LKM 二选一，见 kmod_lookup_kobj） */
+    char kmod_enabled[128];
+    char kmod_freq_limits[128];
+    char kmod_poll_ms[128];
 } CpuTopology;
 
 typedef struct {
@@ -398,52 +406,64 @@ static __attribute__((unused)) bool is_cpu_in_cluster(const CpuTopology* topo, i
     return false;
 }
 
-static int read_thermal_max(void) {
+/* 读取所有温度区里最热的一个。
+ *
+ * 注意: 扫描上限必须覆盖本机全部 thermal_zone。K70 Pro (SM8650) 有 101 个区,
+ * 原先写死 30 会漏掉 gpuss-0..7 / battery / pa_therm / mmw 等关键传感器 ——
+ * 实测漏掉区里就有比 CPU 区更热的读数。
+ */
+#define THERMAL_ZONE_SCAN_MAX 256
+
+static int read_thermal_max(void)
+{
+    /* 只把与功耗决策相关的传感器纳入判定 */
+    static const char *const relevant_keys[] = {
+        "cpu", "soc", "skin", "battery", "pa", "xo", "gpu",
+    };
     int max_temp = 0;
-    for (int i = 0; i < 30; i++) {
+
+    for (int i = 0; i < THERMAL_ZONE_SCAN_MAX; i++) {
         char path[64];
-        // Check type first — only read temp for relevant zones
-        snprintf(path, sizeof(path), THERMAL_ZONE_BASE "%d/type", i);
         char tbuf[64] = {0};
+
+        snprintf(path, sizeof(path), THERMAL_ZONE_BASE "%d/type", i);
         if (!read_file(AT_FDCWD, path, tbuf, sizeof(tbuf))) continue;
         strtrim(tbuf);
-        bool relevant = (strstr(tbuf, "cpu") || strstr(tbuf, "soc") ||
-                         strstr(tbuf, "skin") || strstr(tbuf, "battery") ||
-                         strstr(tbuf, "pa") || strstr(tbuf, "xo") ||
-                         strstr(tbuf, "gpu"));
+
+        bool relevant = false;
+        for (size_t k = 0; k < sizeof(relevant_keys) / sizeof(relevant_keys[0]); k++) {
+            if (strstr(tbuf, relevant_keys[k])) { relevant = true; break; }
+        }
         if (!relevant) continue;
 
         snprintf(path, sizeof(path), THERMAL_ZONE_BASE "%d/temp", i);
         char buf[32] = {0};
         if (read_file(AT_FDCWD, path, buf, sizeof(buf))) {
             int t = atoi(buf);
-            if (t > max_temp) max_temp = t;
+            /* 未接传感器的区会报 -273000 之类的占位值，直接忽略 */
+            if (t > max_temp && t > -40000) max_temp = t;
         }
     }
     return max_temp;
 }
 
+/* 前向声明：apply_freq_limit 复用 apply_cluster_freqs 的按簇写入路径 */
+static void apply_cluster_freqs(const int freqs[MAX_CLUSTERS], const CpuTopology* topo);
+
+/* 对全部 cluster 施加同一个上限（遗留的"全局限频"入口）。
+ *
+ * 原实现盲目遍历 policy1..policy8 并逐个写入。本机实际只有
+ * policy0/policy2/policy5/policy7（多 policy 架构），policy1 等根本不存在，
+ * 4 次写入必然失败；而 per-CPU 兜底又给每个核写了同一个值。
+ * 改为直接复用 apply_cluster_freqs 的按簇写入路径。
+ */
 static void apply_freq_limit(int freq_khz, const CpuTopology* topo) {
     if (freq_khz <= 0) return;
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%d", freq_khz);
 
-    // 写 policy 级节点
-    for (int policy = 1; policy <= 8; policy++) {
-        char path[128];
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/cpufreq/policy%d/scaling_max_freq", policy);
-        write_file(AT_FDCWD, path, buf, O_WRONLY | O_TRUNC);
-    }
+    int freqs[MAX_CLUSTERS];
+    for (int c = 0; c < MAX_CLUSTERS; c++) freqs[c] = freq_khz;
 
-    // 写 per-CPU 节点兜底
-    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
-        if (!CPU_ISSET(cpu, &topo->present_cpus)) continue;
-        char path[128];
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", cpu);
-        write_file(AT_FDCWD, path, buf, O_WRONLY | O_TRUNC);
-    }
+    apply_cluster_freqs(freqs, topo);
 }
 
 static void apply_cluster_freqs(const int freqs[MAX_CLUSTERS], const CpuTopology* topo) {
@@ -464,14 +484,41 @@ static void apply_cluster_freqs(const int freqs[MAX_CLUSTERS], const CpuTopology
 
 /* --- 内核模块集成 (abk_soc_opt) ------------------------------------ */
 
+/* 模块可以用两种方式构建，sysfs 节点位置不同：
+ *   =y (builtin)  → 自定义 kobject : /sys/kernel/abk_soc_opt/
+ *   =m (LKM)      → 模块参数        : /sys/module/abk_soc_opt/parameters/
+ * 两种都要探测，否则换构建方式后会静默失效。 */
+#define KMOD_KO_ENABLED     "/sys/kernel/abk_soc_opt/enabled"
+#define KMOD_PARAM_ENABLED  "/sys/module/abk_soc_opt/parameters/enabled"
+
+/* 所有内核接口路径都在 init_cpu_topo() 之后、任何写入之前解析一次。
+ * build_str() 不做追加，重复调用是幂等的。 */
+static void kmod_lookup_kobj(CpuTopology* topo) {
+    char*  e  = topo->kmod_enabled;
+    char*  fl = topo->kmod_freq_limits;
+    char*  pm = topo->kmod_poll_ms;
+    size_t es = sizeof(topo->kmod_enabled);
+
+    if (access(KMOD_KO_ENABLED, W_OK) == 0) {
+        build_str(e,  es, KMOD_KO_ENABLED, NULL);
+        build_str(fl, es, KMOD_FREQ_LIMITS, NULL);
+        build_str(pm, es, KMOD_POLL_MS, NULL);
+    } else if (access(KMOD_PARAM_ENABLED, W_OK) == 0) {
+        build_str(e,  es, KMOD_PARAM_ENABLED, NULL);
+        build_str(fl, es, KMOD_PARAM_FREQ_LIMITS, NULL);
+        build_str(pm, es, KMOD_PARAM_POLL_MS, NULL);
+    }
+}
+
 static bool kmod_available(void) {
-    return access(KMOD_ENABLED, W_OK) == 0;
+    return access(KMOD_KO_ENABLED, W_OK) == 0 ||
+           access(KMOD_PARAM_ENABLED, W_OK) == 0;
 }
 
 static void kmod_write_freqs(const int freqs[MAX_CLUSTERS],
                               int count, const CpuTopology* topo) {
-    if (!kmod_available()) return;
-    (void)topo;
+    if (!topo->kmod_freq_limits[0]) return;
+    if (count <= 0 || count > MAX_CLUSTERS) count = MAX_CLUSTERS;
 
     /* 跳过全零（无限制，不应写入内核模块） */
     bool all_zero = true;
@@ -485,15 +532,15 @@ static void kmod_write_freqs(const int freqs[MAX_CLUSTERS],
         if (i > 0 && pos < (int)sizeof(buf) - 1) buf[pos++] = ',';
         pos += snprintf(buf + pos, sizeof(buf) - pos, "%d", freqs[i]);
     }
-    if (pos > 0)
-        write_file(AT_FDCWD, KMOD_FREQ_LIMITS, buf, O_WRONLY | O_TRUNC);
+    if (pos > 0 && pos < (int)sizeof(buf))
+        write_file(AT_FDCWD, topo->kmod_freq_limits, buf, O_WRONLY | O_TRUNC);
 }
 
-static void kmod_write_poll_ms(int ms) {
-    if (ms < 0 || !kmod_available()) return;
+static void kmod_write_poll_ms(const CpuTopology* topo, int ms) {
+    if (ms < 0 || !topo->kmod_poll_ms[0]) return;
     char buf[16];
     snprintf(buf, sizeof(buf), "%d", ms);
-    write_file(AT_FDCWD, KMOD_POLL_MS, buf, O_WRONLY | O_TRUNC);
+    write_file(AT_FDCWD, topo->kmod_poll_ms, buf, O_WRONLY | O_TRUNC);
 }
 
 static bool is_display_off(void) {
@@ -1283,17 +1330,30 @@ static bool load_tuber_config(const char* path, TuberConfig* cfg) {
 }
 
 static void print_help(const char* prog_name) {
-    printf("Usage: %s [-c <applist>] [-t <tuber.conf>]\n", prog_name);
+    printf("Usage: %s [-c <applist>] [-t <tuber.conf>] [-p] [-T <mc>]\n", prog_name);
     printf("\n");
     printf("  -c <file>  进程绑定规则文件 (默认: ./applist.conf)\n");
     printf("  -t <file>  运行时配置文件 (默认: ./tuber.conf)\n");
+    printf("  -p         启用功耗优化模式 (覆盖 tuber.conf 的 power.enabled)\n");
+    printf("  -T <mc>    温控触发温度，毫摄氏度 (如 75000 = 75C，覆盖 temp_limit_mc)\n");
     printf("  -v         显示版本\n");
     printf("  -h         帮助\n");
     printf("\n");
     printf("所有运行时参数(频率/温控/息屏/轮询周期)统一在 tuber.conf 中配置。\n");
+    printf("优先级: 命令行 > tuber.conf > 内置默认值\n");
+    printf("\n");
+    printf("已废弃: -f / -g / -F / -G (频率参数)，这些参数会被消费但忽略；\n");
+    printf("        请改用 tuber.conf 的 [freq_on]/[freq_off]/[thermal] limits。\n");
 }
 
 int main(int argc, char **argv) {
+    /* 守护进程必须行缓冲/不缓冲。
+     * 默认 stdout 是块缓冲：以 nohup ... & 方式常驻时，日志会一直留在 4KB
+     * 缓冲区里，一旦进程被信号杀掉（或被 service.sh 重启循环 kill）就全部丢失，
+     * 排查问题时看到的是一个空日志文件。 */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     CpuTopology topo = init_cpu_topo();
 
     if (topo.soc_name[0]) {
@@ -1313,31 +1373,26 @@ int main(int argc, char **argv) {
         printf("\n");
     }
 
-    /* 加载 tuber.conf */
-    TuberConfig tcfg = tuber_defaults();
-    load_tuber_config("./tuber.conf", &tcfg);
-
     char config_file[4096] = "./applist.conf";
-    int sleep_interval = tcfg.sleep_interval;
-    topo.power_save_mode = tcfg.power_save_enabled;
-    topo.temp_limit_mc   = tcfg.temp_limit_mc;
-    memcpy(topo.cluster_freqs, tcfg.on_freqs, sizeof(topo.cluster_freqs));
-    memcpy(topo.thermal_cluster_freqs, tcfg.thermal_freqs, sizeof(topo.thermal_cluster_freqs));
-    /* 检查是否有非零 per-cluster 值 */
-    for (int i = 0; i < MAX_CLUSTERS; i++) {
-        if (topo.cluster_freqs[i] != 0) { topo.use_cluster_freqs = true; break; }
-        if (topo.thermal_cluster_freqs[i] != 0) { topo.use_thermal_cluster_freqs = true; break; }
-    }
-    topo.poll_ms                = tcfg.on_poll_ms;
-    topo.display_off_poll_ms     = tcfg.off_poll_ms;
-    memcpy(topo.display_off_freqs, tcfg.off_freqs, sizeof(topo.display_off_freqs));
-    for (int i = 0; i < MAX_CLUSTERS; i++)
-        if (topo.display_off_freqs[i] != 0) { topo.use_display_off_freqs = true; break; }
+    char tuber_path[256]   = "./tuber.conf";
+    int  sleep_interval;
+    bool cli_power_save = false;
+    int  cli_temp_limit_mc = 0;   /* 0 = 未指定，用配置文件的 */
 
+    /* ---------------------------------------------------------------
+     * 参数解析必须放在加载 tuber.conf 之前，且选项表要覆盖 service.sh
+     * 历史上传过的全部参数。
+     *
+     * 原实现选项表只有 "c:t:hv"，而 service.sh 的降级分支传的是
+     *   -p -t 75000 -f 2000000,... -g 1200000,...
+     * getopt 会因为 -p 未声明而立即停止解析，导致后面的 -c/-t 被整个丢掉，
+     * AppOpt 只能用 "./applist.conf" 兜底启动（静默、且日志被重定向到
+     * /dev/null 所以完全看不到）。这里把遗留参数全部显式接住。
+     *
+     * 优先级: 命令行 > tuber.conf > 默认值
+     * --------------------------------------------------------------- */
     int opt;
-    char tuber_path[256] = "./tuber.conf";
-
-    while ((opt = getopt(argc, argv, "c:t:hv")) != -1) {
+    while ((opt = getopt(argc, argv, "c:t:T:pf:g:F:G:hv")) != -1) {
         switch (opt) {
             case 'c':
                 build_str(config_file, sizeof(config_file), optarg, NULL);
@@ -1345,7 +1400,24 @@ int main(int argc, char **argv) {
                 break;
             case 't':
                 build_str(tuber_path, sizeof(tuber_path), optarg, NULL);
-                printf("TuBer配置: %s\n", tuber_path);
+                break;
+            case 'T':
+                cli_temp_limit_mc = atoi(optarg);
+                break;
+            case 'p':
+                cli_power_save = true;
+                break;
+            case 'f':
+            case 'g':
+            case 'F':
+            case 'G':
+                /* 遗留的频率参数：已统一由 tuber.conf 的
+                 * [freq_on]/[freq_off]/[thermal] 管理，且本模块的
+                 * freq_limits 数组本就会把多余的逗号分隔值丢弃。
+                 * 这里必须消费掉参数，否则会连累后续 -c/-t 解析。 */
+                fprintf(stderr,
+                        "警告: 参数 -%c 已废弃并被忽略，请改用 tuber.conf "
+                        "的 [freq_on]/[freq_off]/[thermal] limits\n", opt);
                 break;
             case 'v':
                 printf("AppOpt 版本 %s\n", VERSION);
@@ -1359,28 +1431,31 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* 重新加载 tuber.conf（可能被 -t 改变了路径） */
-    if (strcmp(tuber_path, "./tuber.conf") != 0) {
-        tcfg = tuber_defaults();
-        load_tuber_config(tuber_path, &tcfg);
-        /* 重新应用配置 */
-        topo.power_save_mode = tcfg.power_save_enabled;
-        topo.temp_limit_mc   = tcfg.temp_limit_mc;
-        memcpy(topo.cluster_freqs, tcfg.on_freqs, sizeof(topo.cluster_freqs));
-        memcpy(topo.thermal_cluster_freqs, tcfg.thermal_freqs, sizeof(topo.thermal_cluster_freqs));
-        topo.use_cluster_freqs = false;
-        topo.use_thermal_cluster_freqs = false;
-        for (int i = 0; i < MAX_CLUSTERS; i++) {
-            if (topo.cluster_freqs[i] != 0) topo.use_cluster_freqs = true;
-            if (topo.thermal_cluster_freqs[i] != 0) topo.use_thermal_cluster_freqs = true;
-        }
-        topo.poll_ms = tcfg.on_poll_ms;
-        topo.display_off_poll_ms = tcfg.off_poll_ms;
-        memcpy(topo.display_off_freqs, tcfg.off_freqs, sizeof(topo.display_off_freqs));
-        topo.use_display_off_freqs = false;
-        for (int i = 0; i < MAX_CLUSTERS; i++)
-            if (topo.display_off_freqs[i] != 0) topo.use_display_off_freqs = true;
+    /* 加载 tuber.conf（只加载一次） */
+    TuberConfig tcfg = tuber_defaults();
+    if (!load_tuber_config(tuber_path, &tcfg))
+        fprintf(stderr, "警告: 无法读取配置文件 %s，使用内置默认值\n", tuber_path);
+    printf("TuBer配置: %s\n", tuber_path);
+
+    sleep_interval = tcfg.sleep_interval;
+
+    /* 命令行优先级高于配置文件 */
+    if (cli_power_save)      tcfg.power_save_enabled = true;
+    if (cli_temp_limit_mc > 0) tcfg.temp_limit_mc    = cli_temp_limit_mc;
+
+    topo.power_save_mode = tcfg.power_save_enabled;
+    topo.temp_limit_mc   = tcfg.temp_limit_mc;   /* 0 = 不启用温控降频 */
+    memcpy(topo.cluster_freqs, tcfg.on_freqs, sizeof(topo.cluster_freqs));
+    memcpy(topo.thermal_cluster_freqs, tcfg.thermal_freqs, sizeof(topo.thermal_cluster_freqs));
+    for (int i = 0; i < MAX_CLUSTERS; i++) {
+        if (topo.cluster_freqs[i] != 0)         topo.use_cluster_freqs = true;
+        if (topo.thermal_cluster_freqs[i] != 0) topo.use_thermal_cluster_freqs = true;
     }
+    topo.poll_ms             = tcfg.on_poll_ms;
+    topo.display_off_poll_ms = tcfg.off_poll_ms;
+    memcpy(topo.display_off_freqs, tcfg.off_freqs, sizeof(topo.display_off_freqs));
+    for (int i = 0; i < MAX_CLUSTERS; i++)
+        if (topo.display_off_freqs[i] != 0) { topo.use_display_off_freqs = true; break; }
 
     struct stat st;
     if (stat(config_file, &st) != 0) {
@@ -1435,12 +1510,40 @@ int main(int argc, char **argv) {
     cache.scan_all_proc = true;
     bool affinity_force = false;
     printf("启动AppOpt服务 v%s\n", VERSION);
+    /* 解析 abk_soc_opt 的 sysfs 路径（builtin / LKM 两种布局），必须在任何写入前做 */
+    kmod_lookup_kobj(&topo);
     /* 启动时写入内核 poll_ms */
-    kmod_write_poll_ms(topo.poll_ms);
+    kmod_write_poll_ms(&topo, topo.poll_ms);
     if (topo.use_display_off_freqs)
         printf("息屏降频已启用 (%d clusters)\n", topo.num_clusters);
-    if (kmod_available())
-        printf("检测到 abk_soc_opt 内核模块，频率限制由内核强制执行\n");
+    if (kmod_available()) {
+        printf("检测到 abk_soc_opt 内核模块: %s\n", topo.kmod_enabled);
+        /* 节点存在不等于模块在干活：内核态可能因为初始化时序问题没有扫到
+         * cluster（num_clusters==0）。那种情况下 freq_limits 的写入会被
+         * 静默接受但完全不生效（store 里 for(i<n && i<num_clusters) 直接空转），
+         * 读回也是空。所以"读失败"和"读成功但为空"都要告警，
+         * 否则用户会以为内核限频正在工作。 */
+        char info[256] = {0};
+        const char* info_path = strstr(topo.kmod_enabled, "/sys/module/")
+            ? "/sys/module/abk_soc_opt/parameters/cluster_info"
+            : "/sys/kernel/abk_soc_opt/cluster_info";
+        bool info_ok = read_file(AT_FDCWD, info_path, info, sizeof(info));
+        if (info_ok) strtrim(info);
+
+        if (!info_ok || info[0] == '\0') {
+            fprintf(stderr,
+                    "警告: abk_soc_opt 已加载，但 %s 读不到 cluster 信息。\n"
+                    "      说明内核态 num_clusters==0（初始化时序早于 cpufreq 驱动就绪），\n"
+                    "      内核限频不会生效，且无法通过重载模块恢复（builtin）。\n"
+                    "      当前仅靠用户态限频维持，效果会被 perfd/thermal 部分覆盖。\n",
+                    info_path);
+        } else {
+            printf("内核模块 cluster 状态:\n%s\n", info);
+        }
+    } else {
+        printf("未检测到 abk_soc_opt 内核模块，仅使用用户态限频\n");
+    }
+    fflush(stdout);
 
     bool prev_display_off = false;
     time_t display_off_at = 0, last_affinity = 0, last_thermal = 0, last_freq = 0;
@@ -1471,20 +1574,22 @@ int main(int argc, char **argv) {
                     apply_cluster_freqs(cfg->topo.display_off_freqs, &cfg->topo);
                     kmod_write_freqs(cfg->topo.display_off_freqs,
                                      cfg->topo.num_clusters, &cfg->topo);
-                    kmod_write_poll_ms(cfg->topo.display_off_poll_ms);
+                    kmod_write_poll_ms(&cfg->topo, cfg->topo.display_off_poll_ms);
                     sleep_interval = tcfg.off_sleep_interval;
                     printf("息屏模式 (延迟%lds) → 省电频率, poll=%dms, 间隔=%ds\n",
                            now - display_off_at, cfg->topo.display_off_poll_ms, sleep_interval);
+                    fflush(stdout);
                 } else {
                     if (cfg->topo.use_cluster_freqs) {
                         apply_cluster_freqs(cfg->topo.cluster_freqs, &cfg->topo);
                         kmod_write_freqs(cfg->topo.cluster_freqs,
                                          cfg->topo.num_clusters, &cfg->topo);
                     }
-                    kmod_write_poll_ms(cfg->topo.poll_ms);
+                    kmod_write_poll_ms(&cfg->topo, cfg->topo.poll_ms);
                     sleep_interval = tcfg.sleep_interval;
                     printf("亮屏恢复 → 日常频率, poll=%dms, 间隔=%ds\n",
                            cfg->topo.poll_ms, sleep_interval);
+                    fflush(stdout);
                 }
             }
             prev_display_off = eff_off;
