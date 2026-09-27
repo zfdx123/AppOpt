@@ -1583,15 +1583,33 @@ int main(int argc, char **argv) {
 
         if (topo.kmod_arm[0]) {
             /* v2.5: 内核态默认不生效，由本进程 arm 之后才开始工作。
-             * 内核侧看门狗盯着本进程 pid，本进程一死就自动收起全部约束。 */
+             * 内核侧看门狗盯着本进程 pid，本进程一死就自动收起全部约束。
+             *
+             * 【顺序很重要】必须先写 freq_limits 再 arm:
+             * arm 会触发内核扫描，内核按 freq_limits 决定每个簇的 cap。
+             * 若此时 freq_limits 还是全 0，内核会按"cap==0 = 离线该簇"
+             * 的语义把几乎所有簇关掉（设备上实测触发过，只剩 1 核运行）。
+             * 内核侧 v2.5 也加了双保险（未配置限额时拒绝 arm），
+             * 但正确顺序仍应由用户态保证。 */
+            if (topo.use_cluster_freqs) {
+                kmod_write_freqs(topo.cluster_freqs, topo.num_clusters, &topo);
+                printf("已写入内核限频: ");
+                for (int i = 0; i < topo.num_clusters; i++)
+                    printf("%s%d", i ? "," : "", topo.cluster_freqs[i]);
+                printf("\n");
+            }
+
             if (kmod_arm(&topo)) {
                 printf("已持有内核态 (arm pid=%d)，内核限频已生效\n", (int)getpid());
             } else {
                 fprintf(stderr,
                         "警告: arm 写入 %s 后内核态未生效 (active!=1)。\n"
-                        "      可能原因: cpufreq 驱动尚未就绪，内核会在重试成功后生效；\n"
-                        "      或 enabled=0。可稍后读 %s 确认。\n",
-                        topo.kmod_arm, topo.kmod_active);
+                        "      常见原因: 还没写入 freq_limits，内核为安全起见拒绝 arm。\n"
+                        "      也可能是 cpufreq 驱动尚未就绪或 enabled=0。\n"
+                        "      可读 %s 与 %s 确认。\n",
+                        topo.kmod_arm,
+                        "/sys/kernel/abk_soc_opt/freq_limits",
+                        topo.kmod_active);
             }
 
             char info[256] = {0};
